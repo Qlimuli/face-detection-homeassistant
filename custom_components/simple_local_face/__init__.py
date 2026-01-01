@@ -2,187 +2,298 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME, Platform
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.typing import ConfigType
+from homeassistant.helpers.storage import Store
+from homeassistant.components.camera import async_get_image
 
 from .const import (
-    ATTR_CAMERA_ENTITY,
-    ATTR_IMAGE_PATH,
-    ATTR_PERSON_NAME,
-    DEFAULT_TOLERANCE,
     DOMAIN,
-    EVENT_FACE_TRAINED,
-    SERVICE_CLEAR_FACES,
-    SERVICE_REMOVE_FACE,
+    STORAGE_KEY,
+    STORAGE_VERSION,
     SERVICE_TRAIN_FACE,
-    STORAGE_DIR,
-    STORAGE_FILE,
+    SERVICE_REMOVE_FACE,
+    SERVICE_LIST_FACES,
+    ATTR_PERSON_NAME,
+    ATTR_IMAGE_PATH,
+    ATTR_CAMERA_ENTITY,
+    DEFAULT_MODEL,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# Schema for train_face service
+PLATFORMS: list[Platform] = [Platform.IMAGE_PROCESSING]
+
+# Service schemas
 TRAIN_FACE_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_PERSON_NAME): cv.string,
-        vol.Exclusive(ATTR_IMAGE_PATH, "image_source"): cv.string,
-        vol.Exclusive(ATTR_CAMERA_ENTITY, "image_source"): cv.entity_id,
+        vol.Optional(ATTR_IMAGE_PATH): cv.string,
+        vol.Optional(ATTR_CAMERA_ENTITY): cv.entity_id,
     }
 )
 
-# Schema for remove_face service
 REMOVE_FACE_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_PERSON_NAME): cv.string,
     }
 )
 
-CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+class FaceEncodingStore:
+    """Class to manage face encoding storage."""
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the store."""
+        self.hass = hass
+        self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+        self._data: dict[str, list[list[float]]] = {}
+        self._lock = asyncio.Lock()
+
+    async def async_load(self) -> None:
+        """Load data from storage."""
+        data = await self._store.async_load()
+        if data:
+            self._data = data
+        else:
+            self._data = {}
+
+    async def async_save(self) -> None:
+        """Save data to storage."""
+        await self._store.async_save(self._data)
+
+    @property
+    def encodings(self) -> dict[str, list[list[float]]]:
+        """Return all encodings."""
+        return self._data
+
+    async def async_add_encoding(
+        self, name: str, encoding: list[float]
+    ) -> None:
+        """Add a face encoding for a person."""
+        async with self._lock:
+            if name not in self._data:
+                self._data[name] = []
+            self._data[name].append(encoding)
+            await self.async_save()
+
+    async def async_remove_person(self, name: str) -> bool:
+        """Remove all encodings for a person."""
+        async with self._lock:
+            if name in self._data:
+                del self._data[name]
+                await self.async_save()
+                return True
+            return False
+
+    def get_all_names(self) -> list[str]:
+        """Get all trained person names."""
+        return list(self._data.keys())
+
+    def get_encoding_count(self, name: str) -> int:
+        """Get the number of encodings for a person."""
+        return len(self._data.get(name, []))
 
 
-def get_storage_path(hass: HomeAssistant) -> Path:
-    """Get the path to the storage file."""
-    return Path(hass.config.path(STORAGE_DIR)) / STORAGE_FILE
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Set up the Simple Local Face Recognition component."""
+    hass.data.setdefault(DOMAIN, {})
+    return True
 
 
-def load_encodings(hass: HomeAssistant) -> dict[str, list]:
-    """Load face encodings from storage."""
-    storage_path = get_storage_path(hass)
-    if storage_path.exists():
-        try:
-            with open(storage_path, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as err:
-            _LOGGER.error("Error loading face encodings: %s", err)
-    return {}
-
-
-def save_encodings(hass: HomeAssistant, encodings: dict[str, list]) -> bool:
-    """Save face encodings to storage."""
-    storage_path = get_storage_path(hass)
-    storage_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(storage_path, "w") as f:
-            json.dump(encodings, f, indent=2)
-        return True
-    except IOError as err:
-        _LOGGER.error("Error saving face encodings: %s", err)
-        return False
-
-
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up Simple Local Face Recognition from YAML."""
-    hass.data.setdefault(DOMAIN, {"encodings": {}})
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Simple Local Face Recognition from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
     
-    # Load existing encodings
-    encodings = await hass.async_add_executor_job(load_encodings, hass)
-    hass.data[DOMAIN]["encodings"] = encodings
-    _LOGGER.info("Loaded %d known faces", len(encodings))
+    # Initialize storage
+    store = FaceEncodingStore(hass)
+    await store.async_load()
+    
+    hass.data[DOMAIN][entry.entry_id] = {
+        "store": store,
+        "config": entry.data,
+    }
+    hass.data[DOMAIN]["store"] = store
+
+    # Register services
+    await _async_register_services(hass)
+
+    # Set up platforms
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Reload on options update
+    entry.async_on_unload(entry.add_update_listener(async_reload_entry))
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        
+        # Remove services if no more entries
+        if not hass.config_entries.async_entries(DOMAIN):
+            hass.services.async_remove(DOMAIN, SERVICE_TRAIN_FACE)
+            hass.services.async_remove(DOMAIN, SERVICE_REMOVE_FACE)
+            hass.services.async_remove(DOMAIN, SERVICE_LIST_FACES)
+            hass.data[DOMAIN].pop("store", None)
+
+    return unload_ok
+
+
+async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload config entry."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def _async_register_services(hass: HomeAssistant) -> None:
+    """Register services for face recognition."""
+    
+    if hass.services.has_service(DOMAIN, SERVICE_TRAIN_FACE):
+        return
 
     async def async_train_face(call: ServiceCall) -> None:
-        """Handle the train_face service call."""
+        """Train a face from an image."""
         person_name = call.data[ATTR_PERSON_NAME]
         image_path = call.data.get(ATTR_IMAGE_PATH)
         camera_entity = call.data.get(ATTR_CAMERA_ENTITY)
 
-        _LOGGER.debug(
-            "Training face for '%s' from %s",
-            person_name,
-            image_path or camera_entity,
-        )
+        if not image_path and not camera_entity:
+            _LOGGER.error("Either image_path or camera_entity must be provided")
+            return
+
+        store: FaceEncodingStore = hass.data[DOMAIN].get("store")
+        if not store:
+            _LOGGER.error("Face recognition store not initialized")
+            return
 
         image_data = None
 
-        if image_path:
-            # Load from file path
-            if not os.path.isabs(image_path):
-                image_path = hass.config.path(image_path)
-            
-            if not os.path.exists(image_path):
-                _LOGGER.error("Image file not found: %s", image_path)
-                return
-
-            def load_image_from_file():
-                with open(image_path, "rb") as f:
-                    return f.read()
-
-            image_data = await hass.async_add_executor_job(load_image_from_file)
-
-        elif camera_entity:
-            # Get image from camera entity
-            camera = hass.components.camera
+        # Get image from camera
+        if camera_entity:
             try:
-                image = await camera.async_get_image(camera_entity)
-                image_data = image.content
+                camera_image = await async_get_image(hass, camera_entity)
+                image_data = camera_image.content
             except Exception as err:
-                _LOGGER.error("Error getting camera image: %s", err)
+                _LOGGER.error("Failed to get image from camera %s: %s", camera_entity, err)
                 return
+        
+        # Get image from file
+        elif image_path:
+            try:
+                def read_image():
+                    with open(image_path, "rb") as f:
+                        return f.read()
+                image_data = await hass.async_add_executor_job(read_image)
+            except Exception as err:
+                _LOGGER.error("Failed to read image file %s: %s", image_path, err)
+                return
+
+        if not image_data:
+            _LOGGER.error("No image data available")
+            return
+
+        # Process image and extract face encoding
+        def process_image():
+            import face_recognition
+            import numpy as np
+            
+            # Decode image
+            nparr = np.frombuffer(image_data, np.uint8)
+            import cv2
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if image is None:
+                return None
+            
+            # Convert BGR to RGB
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Find faces and get encodings
+            face_locations = face_recognition.face_locations(rgb_image, model=DEFAULT_MODEL)
+            
+            if not face_locations:
+                return None
+            
+            face_encodings = face_recognition.face_encodings(rgb_image, face_locations)
+            
+            if not face_encodings:
+                return None
+            
+            # Return the first face encoding as list
+            return face_encodings[0].tolist()
+
+        encoding = await hass.async_add_executor_job(process_image)
+
+        if encoding:
+            await store.async_add_encoding(person_name, encoding)
+            _LOGGER.info(
+                "Successfully trained face for %s (total encodings: %d)",
+                person_name,
+                store.get_encoding_count(person_name),
+            )
+            
+            # Fire event
+            hass.bus.async_fire(
+                f"{DOMAIN}_face_trained",
+                {
+                    "person_name": person_name,
+                    "encoding_count": store.get_encoding_count(person_name),
+                },
+            )
         else:
-            _LOGGER.error("No image source provided")
-            return
-
-        # Process the image and extract encoding
-        encoding = await hass.async_add_executor_job(
-            _compute_face_encoding, image_data
-        )
-
-        if encoding is None:
-            _LOGGER.warning("No face found in image for '%s'", person_name)
-            return
-
-        # Store the encoding
-        encodings = hass.data[DOMAIN]["encodings"]
-        if person_name not in encodings:
-            encodings[person_name] = []
-        
-        encodings[person_name].append(encoding)
-        
-        # Save to storage
-        await hass.async_add_executor_job(save_encodings, hass, encodings)
-        
-        _LOGGER.info(
-            "Successfully trained face for '%s' (total samples: %d)",
-            person_name,
-            len(encodings[person_name]),
-        )
-
-        # Fire event
-        hass.bus.async_fire(
-            EVENT_FACE_TRAINED,
-            {
-                "person_name": person_name,
-                "total_samples": len(encodings[person_name]),
-            },
-        )
+            _LOGGER.error("No face found in the provided image for %s", person_name)
 
     async def async_remove_face(call: ServiceCall) -> None:
-        """Handle the remove_face service call."""
+        """Remove a trained face."""
         person_name = call.data[ATTR_PERSON_NAME]
-        encodings = hass.data[DOMAIN]["encodings"]
+        
+        store: FaceEncodingStore = hass.data[DOMAIN].get("store")
+        if not store:
+            _LOGGER.error("Face recognition store not initialized")
+            return
 
-        if person_name in encodings:
-            del encodings[person_name]
-            await hass.async_add_executor_job(save_encodings, hass, encodings)
-            _LOGGER.info("Removed face data for '%s'", person_name)
+        if await store.async_remove_person(person_name):
+            _LOGGER.info("Removed face data for %s", person_name)
+            hass.bus.async_fire(
+                f"{DOMAIN}_face_removed",
+                {"person_name": person_name},
+            )
         else:
-            _LOGGER.warning("No face data found for '%s'", person_name)
+            _LOGGER.warning("No face data found for %s", person_name)
 
-    async def async_clear_faces(call: ServiceCall) -> None:
-        """Handle the clear_faces service call."""
-        hass.data[DOMAIN]["encodings"] = {}
-        await hass.async_add_executor_job(save_encodings, hass, {})
-        _LOGGER.info("Cleared all face data")
+    async def async_list_faces(call: ServiceCall) -> None:
+        """List all trained faces."""
+        store: FaceEncodingStore = hass.data[DOMAIN].get("store")
+        if not store:
+            _LOGGER.error("Face recognition store not initialized")
+            return
+
+        names = store.get_all_names()
+        face_info = {
+            name: store.get_encoding_count(name) for name in names
+        }
+        
+        hass.bus.async_fire(
+            f"{DOMAIN}_faces_listed",
+            {"faces": face_info, "total_persons": len(names)},
+        )
+        _LOGGER.info("Trained faces: %s", face_info)
 
     # Register services
     hass.services.async_register(
@@ -192,50 +303,5 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         DOMAIN, SERVICE_REMOVE_FACE, async_remove_face, schema=REMOVE_FACE_SCHEMA
     )
     hass.services.async_register(
-        DOMAIN, SERVICE_CLEAR_FACES, async_clear_faces
+        DOMAIN, SERVICE_LIST_FACES, async_list_faces, schema=None
     )
-
-    return True
-
-
-def _compute_face_encoding(image_data: bytes) -> list[float] | None:
-    """Compute face encoding from image data (runs in executor)."""
-    import io
-    
-    try:
-        import face_recognition
-        import numpy as np
-        from PIL import Image
-    except ImportError as err:
-        _LOGGER.error("Required library not installed: %s", err)
-        return None
-
-    try:
-        # Load image from bytes
-        image = Image.open(io.BytesIO(image_data))
-        
-        # Convert to RGB if necessary
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        
-        # Convert to numpy array
-        image_array = np.array(image)
-        
-        # Find face locations
-        face_locations = face_recognition.face_locations(image_array, model="hog")
-        
-        if not face_locations:
-            _LOGGER.debug("No face detected in image")
-            return None
-        
-        # Get encoding for the first face found
-        encodings = face_recognition.face_encodings(image_array, face_locations)
-        
-        if encodings:
-            return encodings[0].tolist()
-        
-        return None
-        
-    except Exception as err:
-        _LOGGER.error("Error computing face encoding: %s", err)
-        return None

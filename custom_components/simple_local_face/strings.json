@@ -1,0 +1,86 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure Face Recognition",
+        "description": "Set up local face recognition for a camera. Found {camera_count} cameras available.",
+        "data": {
+          "camera_entity": "Camera",
+          "tolerance": "Recognition Tolerance",
+          "scan_interval": "Scan Interval (seconds)",
+          "detect_unknown": "Detect Unknown Faces",
+          "model": "Detection Model"
+        },
+        "data_description": {
+          "camera_entity": "Select the camera to use for face recognition",
+          "tolerance": "Lower values require closer matches (0.6 recommended)",
+          "scan_interval": "How often to scan for faces (0 = manual only)",
+          "detect_unknown": "Fire events when unknown faces are detected",
+          "model": "HOG is faster but less accurate, CNN is slower but more accurate"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This camera is already configured for face recognition",
+      "no_cameras": "No cameras found. Please set up a camera first."
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to camera",
+      "unknown": "Unknown error occurred"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Face Recognition Options",
+        "description": "Adjust face recognition settings",
+        "data": {
+          "tolerance": "Recognition Tolerance",
+          "scan_interval": "Scan Interval (seconds)",
+          "detect_unknown": "Detect Unknown Faces",
+          "model": "Detection Model"
+        },
+        "data_description": {
+          "tolerance": "Lower values require closer matches (0.6 recommended)",
+          "scan_interval": "How often to scan for faces (0 = manual only)",
+          "detect_unknown": "Fire events when unknown faces are detected",
+          "model": "HOG is faster but less accurate, CNN is slower but more accurate"
+        }
+      }
+    }
+  },
+  "services": {
+    "train_face": {
+      "name": "Train Face",
+      "description": "Train a new face from an image file or camera snapshot",
+      "fields": {
+        "person_name": {
+          "name": "Person Name",
+          "description": "Name of the person to train"
+        },
+        "image_path": {
+          "name": "Image Path",
+          "description": "Path to an image file (e.g., /config/www/faces/john.jpg)"
+        },
+        "camera_entity": {
+          "name": "Camera Entity",
+          "description": "Camera entity to take a snapshot from"
+        }
+      }
+    },
+    "remove_face": {
+      "name": "Remove Face",
+      "description": "Remove all trained data for a person",
+      "fields": {
+        "person_name": {
+          "name": "Person Name",
+          "description": "Name of the person to remove"
+        }
+      }
+    },
+    "list_faces": {
+      "name": "List Faces",
+      "description": "List all trained faces and their encoding counts"
+    }
+  }
+}
