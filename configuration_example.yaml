@@ -1,73 +1,210 @@
-# Example configuration.yaml for Local Face Secure
-# Add this to your Home Assistant configuration.yaml
+# =============================================================================
+# Local Face Secure - Configuration Example
+# =============================================================================
+# 
+# This file demonstrates how to configure and use the local_face_secure
+# integration in your Home Assistant instance.
+#
+# Installation:
+# 1. Copy the 'local_face_secure' folder to your 'custom_components' directory
+# 2. Restart Home Assistant
+# 3. Add the configuration below to your configuration.yaml
+#
+# Requirements:
+# - A camera entity (e.g., from a generic camera, RTSP stream, or integration)
+# - The face_recognition library will be installed automatically
+#
+# Note: First run may take longer as dlib models are downloaded (~100MB)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Basic Configuration
+# -----------------------------------------------------------------------------
+# Add this to your configuration.yaml to enable the integration
 
 local_face_secure:
-  tolerance: 0.6  # Optional: default match tolerance (0.1-1.0, lower = stricter)
+  # Optional: Face matching tolerance (0.0 - 1.0)
+  # Lower values = stricter matching (fewer false positives, more false negatives)
+  # Higher values = looser matching (more false positives, fewer false negatives)
+  # Default: 0.6 (recommended starting point)
+  tolerance: 0.6
 
-# Example automations using the component
+# -----------------------------------------------------------------------------
+# Example Automations
+# -----------------------------------------------------------------------------
 
 automation:
-  # Automation: Recognize person at front door
-  - alias: "Front Door Face Recognition"
+  # Automation 1: Greet known people when they arrive
+  - id: face_recognition_greeting
+    alias: "Greet Recognized Person"
+    description: "Announce when a known person is recognized at the front door"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.recognized
+    condition:
+      # Only trigger if confidence is above 70%
+      - condition: template
+        value_template: "{{ trigger.event.data.confidence >= 70 }}"
+    action:
+      - service: tts.speak
+        target:
+          entity_id: tts.home_assistant_cloud
+        data:
+          message: "Welcome home, {{ trigger.event.data.name }}!"
+          media_player_entity_id: media_player.living_room_speaker
+      - service: notify.mobile_app
+        data:
+          title: "Person Recognized"
+          message: "{{ trigger.event.data.name }} arrived ({{ trigger.event.data.confidence }}% confidence)"
+
+  # Automation 2: Scan for faces when motion is detected
+  - id: face_recognition_on_motion
+    alias: "Scan Faces on Motion"
+    description: "Automatically scan for faces when motion is detected"
     trigger:
       - platform: state
         entity_id: binary_sensor.front_door_motion
         to: "on"
     action:
+      # Small delay to allow person to face the camera
+      - delay:
+          seconds: 1
       - service: local_face_secure.scan_match
         data:
           entity_id: camera.front_door
-          tolerance: 0.5
 
-  # Automation: Welcome recognized person
-  - alias: "Welcome Known Person"
+  # Automation 3: Log unknown faces
+  - id: face_recognition_unknown
+    alias: "Alert on Unknown Face"
+    description: "Send notification when face scan finds no matches"
     trigger:
       - platform: event
         event_type: local_face_secure.recognized
+    condition: []
     action:
-      - service: notify.mobile_app
-        data:
-          title: "Person Recognized"
-          message: "{{ trigger.event.data.name }} detected at the door ({{ trigger.event.data.confidence }}% confidence)"
-      - service: tts.speak
-        target:
-          entity_id: tts.home_assistant_cloud
-        data:
-          message: "Welcome home, {{ trigger.event.data.name }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.event.data.confidence < 50 }}"
+            sequence:
+              - service: notify.mobile_app
+                data:
+                  title: "Unknown Person"
+                  message: "Unrecognized face detected at the front door"
+                  data:
+                    image: /api/camera_proxy/camera.front_door
 
-  # Automation: Alert on unknown face
-  - alias: "Unknown Face Alert"
-    trigger:
-      - platform: event
-        event_type: local_face_secure.no_face_found
-    condition:
-      - condition: template
-        value_template: "{{ trigger.event.data.faces_detected > 0 }}"
-    action:
-      - service: notify.mobile_app
-        data:
-          title: "Unknown Person"
-          message: "Unknown person detected at {{ trigger.event.data.entity_id }}"
+# -----------------------------------------------------------------------------
+# Example Scripts
+# -----------------------------------------------------------------------------
 
-  # Automation: Teach face via button
-  - alias: "Teach Face Button"
-    trigger:
-      - platform: state
-        entity_id: input_button.teach_face
-    action:
+script:
+  # Script to teach a new face
+  teach_new_face:
+    alias: "Teach New Face"
+    description: "Capture and learn a new face from the front door camera"
+    fields:
+      person_name:
+        description: "Name of the person to learn"
+        example: "Stefan"
+    sequence:
       - service: local_face_secure.teach_face
         data:
           entity_id: camera.front_door
-          name: "{{ states('input_text.face_name') }}"
+          name: "{{ person_name }}"
 
-# Helper entities for teaching faces via UI
+  # Script to manually trigger face scan
+  manual_face_scan:
+    alias: "Manual Face Scan"
+    description: "Manually scan for faces at the front door"
+    sequence:
+      - service: local_face_secure.scan_match
+        data:
+          entity_id: camera.front_door
+        response_variable: scan_result
+      - service: persistent_notification.create
+        data:
+          title: "Face Scan Results"
+          message: >-
+            {% if scan_result.matches %}
+            Recognized: 
+            {% for match in scan_result.matches %}
+            - {{ match.name }} ({{ match.confidence }}%)
+            {% endfor %}
+            {% else %}
+            No faces recognized.
+            {% endif %}
+
+  # Script to list all known faces
+  list_known_faces:
+    alias: "List Known Faces"
+    description: "Show all faces stored in the system"
+    sequence:
+      - service: local_face_secure.list_faces
+        response_variable: faces_result
+      - service: persistent_notification.create
+        data:
+          title: "Known Faces"
+          message: >-
+            {% if faces_result.faces %}
+            Stored faces ({{ faces_result.count }}):
+            {% for name in faces_result.faces %}
+            - {{ name }}
+            {% endfor %}
+            {% else %}
+            No faces stored yet.
+            {% endif %}
+
+# -----------------------------------------------------------------------------
+# Dashboard Card Example (Lovelace)
+# -----------------------------------------------------------------------------
+# Add this to your Lovelace dashboard for a simple face recognition control panel
+#
+# type: vertical-stack
+# cards:
+#   - type: markdown
+#     content: |
+#       ## 🔐 Face Recognition
+#       Manage face recognition for your home security.
+#   
+#   - type: picture-entity
+#     entity: camera.front_door
+#     name: Front Door Camera
+#   
+#   - type: horizontal-stack
+#     cards:
+#       - type: button
+#         name: Scan Now
+#         icon: mdi:face-recognition
+#         tap_action:
+#           action: call-service
+#           service: local_face_secure.scan_match
+#           data:
+#             entity_id: camera.front_door
+#       
+#       - type: button
+#         name: List Faces
+#         icon: mdi:account-group
+#         tap_action:
+#           action: call-service
+#           service: script.list_known_faces
+#   
+#   - type: entity
+#     entity: input_text.new_face_name
+#   
+#   - type: button
+#     name: Teach Face
+#     icon: mdi:account-plus
+#     tap_action:
+#       action: call-service
+#       service: local_face_secure.teach_face
+#       data:
+#         entity_id: camera.front_door
+#         name: "{{ states('input_text.new_face_name') }}"
+
+# Input helper for the dashboard (add to configuration.yaml)
 input_text:
-  face_name:
-    name: "Face Name"
+  new_face_name:
+    name: New Face Name
     initial: ""
     max: 50
-
-input_button:
-  teach_face:
-    name: "Teach Face"
-    icon: mdi:face-recognition

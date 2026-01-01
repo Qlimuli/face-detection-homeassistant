@@ -1,56 +1,50 @@
 # Service definitions for Local Face Secure
+# These are used by Home Assistant to generate the UI for services
 
 teach_face:
   name: Teach Face
-  description: Capture a face from camera and learn it with a given name.
+  description: >-
+    Capture a snapshot from a camera and learn a face. 
+    The image must contain exactly one face.
   fields:
     entity_id:
-      name: Camera Entity
-      description: The camera entity to capture from.
+      name: Camera
+      description: The camera entity to capture the snapshot from.
       required: true
       example: "camera.front_door"
       selector:
         entity:
           domain: camera
     name:
-      name: Person Name
-      description: The name to associate with this face.
+      name: Name
+      description: The name to associate with this face (e.g., person's name).
       required: true
       example: "Stefan"
       selector:
         text:
 
 scan_match:
-  name: Scan and Match
-  description: Scan camera for a face and match against known faces.
+  name: Scan & Match
+  description: >-
+    Capture a snapshot from a camera and compare detected faces against 
+    all stored face encodings. Fires a local_face_secure.recognized event 
+    for each matched face.
   fields:
     entity_id:
-      name: Camera Entity
-      description: The camera entity to scan.
+      name: Camera
+      description: The camera entity to capture the snapshot from.
       required: true
       example: "camera.front_door"
       selector:
         entity:
           domain: camera
-    tolerance:
-      name: Match Tolerance
-      description: How strict the matching should be (lower = stricter, default 0.6).
-      required: false
-      default: 0.6
-      example: 0.5
-      selector:
-        number:
-          min: 0.1
-          max: 1.0
-          step: 0.05
-          mode: slider
 
 delete_face:
   name: Delete Face
-  description: Remove a learned face from the database.
+  description: Remove a stored face encoding by name.
   fields:
     name:
-      name: Person Name
+      name: Name
       description: The name of the face to delete.
       required: true
       example: "Stefan"
@@ -59,4 +53,4 @@ delete_face:
 
 list_faces:
   name: List Faces
-  description: List all known faces in the database.
+  description: Get a list of all stored face names.
