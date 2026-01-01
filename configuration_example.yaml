@@ -1,0 +1,73 @@
+# Example configuration.yaml for Local Face Secure
+# Add this to your Home Assistant configuration.yaml
+
+local_face_secure:
+  tolerance: 0.6  # Optional: default match tolerance (0.1-1.0, lower = stricter)
+
+# Example automations using the component
+
+automation:
+  # Automation: Recognize person at front door
+  - alias: "Front Door Face Recognition"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_door_motion
+        to: "on"
+    action:
+      - service: local_face_secure.scan_match
+        data:
+          entity_id: camera.front_door
+          tolerance: 0.5
+
+  # Automation: Welcome recognized person
+  - alias: "Welcome Known Person"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.recognized
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "Person Recognized"
+          message: "{{ trigger.event.data.name }} detected at the door ({{ trigger.event.data.confidence }}% confidence)"
+      - service: tts.speak
+        target:
+          entity_id: tts.home_assistant_cloud
+        data:
+          message: "Welcome home, {{ trigger.event.data.name }}"
+
+  # Automation: Alert on unknown face
+  - alias: "Unknown Face Alert"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.no_face_found
+    condition:
+      - condition: template
+        value_template: "{{ trigger.event.data.faces_detected > 0 }}"
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "Unknown Person"
+          message: "Unknown person detected at {{ trigger.event.data.entity_id }}"
+
+  # Automation: Teach face via button
+  - alias: "Teach Face Button"
+    trigger:
+      - platform: state
+        entity_id: input_button.teach_face
+    action:
+      - service: local_face_secure.teach_face
+        data:
+          entity_id: camera.front_door
+          name: "{{ states('input_text.face_name') }}"
+
+# Helper entities for teaching faces via UI
+input_text:
+  face_name:
+    name: "Face Name"
+    initial: ""
+    max: 50
+
+input_button:
+  teach_face:
+    name: "Teach Face"
+    icon: mdi:face-recognition
