@@ -1,0 +1,417 @@
+# ==============================================================================
+# LOCAL FACE SECURE - Configuration Example
+# ==============================================================================
+# This file demonstrates how to configure and use the Local Face Secure
+# custom component in your Home Assistant setup.
+#
+# INSTALLATION:
+# 1. Copy the local_face_secure folder to: /config/custom_components/
+# 2. Add the configuration below to your configuration.yaml
+# 3. Restart Home Assistant
+# ==============================================================================
+
+# ==============================================================================
+# BASIC CONFIGURATION
+# ==============================================================================
+# Minimal configuration - this is all you need!
+local_face_secure:
+
+# That's it! No additional configuration required.
+# The component will automatically:
+# - Load on Home Assistant startup
+# - Create persistent storage
+# - Register all services
+# - Be ready to use
+
+# ==============================================================================
+# USAGE EXAMPLES
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# METHOD 1: Using Scripts (Recommended for UI access)
+# ------------------------------------------------------------------------------
+script:
+  # Teach a face from the front door camera
+  teach_face_stefan:
+    alias: "Teach Stefan's Face"
+    sequence:
+      - service: local_face_secure.teach_face
+        data:
+          entity_id: camera.front_door
+          name: Stefan
+
+  teach_face_maria:
+    alias: "Teach Maria's Face"
+    sequence:
+      - service: local_face_secure.teach_face
+        data:
+          entity_id: camera.front_door
+          name: Maria
+
+  # Scan for any known face
+  scan_front_door:
+    alias: "Scan Front Door"
+    sequence:
+      - service: local_face_secure.scan_match
+        data:
+          entity_id: camera.front_door
+
+  # Delete a face
+  delete_face_example:
+    alias: "Delete Stefan's Face"
+    sequence:
+      - service: local_face_secure.delete_face
+        data:
+          name: Stefan
+
+  # List all faces
+  list_all_faces:
+    alias: "List All Known Faces"
+    sequence:
+      - service: local_face_secure.list_faces
+        response_variable: faces
+      - service: notify.persistent_notification
+        data:
+          title: "Known Faces"
+          message: "{{ faces.faces | join(', ') }}"
+
+# ------------------------------------------------------------------------------
+# METHOD 2: Automations (For automatic face recognition)
+# ------------------------------------------------------------------------------
+automation:
+  # Auto-scan when doorbell is pressed
+  - id: scan_on_doorbell
+    alias: "Scan Face on Doorbell Press"
+    description: "Automatically recognize who's at the door"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_doorbell
+        to: "on"
+    action:
+      - service: local_face_secure.scan_match
+        data:
+          entity_id: camera.front_door
+
+  # Notify when a specific person is recognized
+  - id: notify_stefan_recognized
+    alias: "Notify When Stefan Arrives"
+    description: "Send notification when Stefan is detected"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.recognized
+        event_data:
+          name: Stefan
+    condition:
+      # Only notify if confidence is high enough
+      - condition: template
+        value_template: "{{ trigger.event.data.confidence > 85 }}"
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "Welcome Home Stefan!"
+          message: >
+            Recognized at {{ now().strftime('%I:%M %p') }}
+            ({{ trigger.event.data.confidence }}% confidence)
+
+  # Unlock door for known faces with high confidence
+  - id: unlock_for_recognized_face
+    alias: "Unlock Door for Recognized Face"
+    description: "Auto-unlock for known people"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.recognized
+    condition:
+      # Only unlock for high confidence matches
+      - condition: template
+        value_template: "{{ trigger.event.data.confidence > 90 }}"
+      # Only during daytime
+      - condition: sun
+        after: sunrise
+        before: sunset
+      # Only for specific people
+      - condition: template
+        value_template: >
+          {{ trigger.event.data.name in ['Stefan', 'Maria'] }}
+    action:
+      - service: lock.unlock
+        target:
+          entity_id: lock.front_door
+      - service: notify.mobile_app
+        data:
+          title: "Door Unlocked"
+          message: "Door unlocked for {{ trigger.event.data.name }}"
+
+  # Log all face recognition attempts
+  - id: log_face_recognition
+    alias: "Log Face Recognition"
+    description: "Keep track of all recognized faces"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.recognized
+    action:
+      - service: logbook.log
+        data:
+          name: "Face Recognition"
+          message: >
+            {{ trigger.event.data.name }} recognized 
+            ({{ trigger.event.data.confidence }}% confidence)
+          entity_id: "{{ trigger.event.data.entity_id }}"
+
+  # Alert on unknown face (no match)
+  # Note: This requires periodic scanning to work
+  - id: alert_unknown_face
+    alias: "Alert on Unknown Face"
+    description: "Notify when unrecognized person detected"
+    trigger:
+      - platform: time_pattern
+        minutes: "/10"  # Check every 10 minutes
+    action:
+      - service: local_face_secure.scan_match
+        data:
+          entity_id: camera.front_door
+      # Wait a moment for event to fire
+      - delay:
+          seconds: 5
+      # Check if no event was fired (no match found)
+      # This is a simplified example - production would use more sophisticated logic
+
+  # Periodic scanning (active monitoring)
+  - id: periodic_face_scan
+    alias: "Periodic Face Scanning"
+    description: "Continuously monitor front door"
+    trigger:
+      - platform: time_pattern
+        minutes: "/5"  # Every 5 minutes
+    condition:
+      # Only scan when someone is likely to arrive
+      - condition: time
+        after: "07:00:00"
+        before: "22:00:00"
+    action:
+      - service: local_face_secure.scan_match
+        data:
+          entity_id: camera.front_door
+
+  # Turn on lights when recognized
+  - id: lights_on_recognition
+    alias: "Turn On Lights for Known Person"
+    description: "Welcome home with lights"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.recognized
+    condition:
+      - condition: sun
+        after: sunset
+      - condition: template
+        value_template: "{{ trigger.event.data.confidence > 85 }}"
+    action:
+      - service: light.turn_on
+        target:
+          entity_id: light.porch
+        data:
+          brightness: 255
+
+  # Send photo with notification
+  - id: send_photo_with_recognition
+    alias: "Send Photo with Face Recognition"
+    description: "Send camera snapshot when face is recognized"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.recognized
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "Face Recognized: {{ trigger.event.data.name }}"
+          message: "Confidence: {{ trigger.event.data.confidence }}%"
+          data:
+            image: "/api/camera_proxy/camera.front_door"
+
+# ------------------------------------------------------------------------------
+# METHOD 3: Input Helpers for Dynamic Teaching (Optional)
+# ------------------------------------------------------------------------------
+input_text:
+  face_teach_name:
+    name: "Name for Face Teaching"
+    initial: ""
+    max: 50
+
+input_select:
+  face_camera:
+    name: "Camera for Face Recognition"
+    options:
+      - camera.front_door
+      - camera.back_door
+      - camera.garage
+    initial: camera.front_door
+
+# Dynamic teach script using input helpers
+script:
+  teach_face_dynamic:
+    alias: "Teach Face (Dynamic)"
+    sequence:
+      - service: local_face_secure.teach_face
+        data:
+          entity_id: "{{ states('input_select.face_camera') }}"
+          name: "{{ states('input_text.face_teach_name') }}"
+
+# ------------------------------------------------------------------------------
+# ADVANCED: Multiple Camera Setup
+# ------------------------------------------------------------------------------
+automation:
+  # Scan multiple cameras when motion detected
+  - id: multi_camera_scan
+    alias: "Multi-Camera Face Scan"
+    description: "Scan all cameras when motion detected"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.motion_front
+        to: "on"
+    action:
+      - service: local_face_secure.scan_match
+        data:
+          entity_id: camera.front_door
+      - delay:
+          seconds: 2
+      - service: local_face_secure.scan_match
+        data:
+          entity_id: camera.side_door
+
+# ------------------------------------------------------------------------------
+# ADVANCED: Conditional Actions Based on Who Is Recognized
+# ------------------------------------------------------------------------------
+automation:
+  - id: personalized_greeting
+    alias: "Personalized Greeting"
+    description: "Different actions for different people"
+    trigger:
+      - platform: event
+        event_type: local_face_secure.recognized
+    action:
+      - choose:
+          # Stefan's preferences
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.event.data.name == 'Stefan' }}"
+            sequence:
+              - service: media_player.play_media
+                target:
+                  entity_id: media_player.kitchen
+                data:
+                  media_content_id: "stefan_playlist"
+                  media_content_type: "playlist"
+              - service: climate.set_temperature
+                target:
+                  entity_id: climate.living_room
+                data:
+                  temperature: 22
+          
+          # Maria's preferences
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.event.data.name == 'Maria' }}"
+            sequence:
+              - service: media_player.play_media
+                target:
+                  entity_id: media_player.kitchen
+                data:
+                  media_content_id: "maria_playlist"
+                  media_content_type: "playlist"
+              - service: climate.set_temperature
+                target:
+                  entity_id: climate.living_room
+                data:
+                  temperature: 24
+        
+        # Default for other recognized people
+        default:
+          - service: notify.mobile_app
+            data:
+              message: "{{ trigger.event.data.name }} is here!"
+
+# ==============================================================================
+# DASHBOARD CARD EXAMPLES
+# ==============================================================================
+# Add these to your Lovelace dashboard for easy access
+
+# Example 1: Simple buttons card
+# type: entities
+# entities:
+#   - entity: script.teach_face_stefan
+#     name: Teach Stefan's Face
+#   - entity: script.scan_front_door
+#     name: Scan Front Door
+#   - entity: script.list_all_faces
+#     name: List All Faces
+
+# Example 2: Picture glance with camera
+# type: picture-glance
+# title: Front Door Face Recognition
+# camera_image: camera.front_door
+# entities:
+#   - entity: script.scan_front_door
+#     icon: mdi:face-recognition
+
+# Example 3: Button card with dynamic input
+# type: vertical-stack
+# cards:
+#   - type: entities
+#     entities:
+#       - entity: input_text.face_teach_name
+#       - entity: input_select.face_camera
+#   - type: button
+#     name: Teach Face
+#     tap_action:
+#       action: call-service
+#       service: script.teach_face_dynamic
+
+# ==============================================================================
+# NOTES AND BEST PRACTICES
+# ==============================================================================
+
+# 1. TEACHING FACES:
+#    - Use good lighting
+#    - Face should be clearly visible and centered
+#    - Only one person in frame
+#    - Multiple angles can improve recognition (teach same person 2-3 times)
+
+# 2. MATCHING:
+#    - Confidence > 85% is generally reliable
+#    - Confidence < 70% may be false positives
+#    - Test with your specific cameras and lighting
+
+# 3. PERFORMANCE:
+#    - Face recognition is CPU intensive
+#    - Don't scan too frequently (every 30-60 seconds is reasonable)
+#    - Consider motion detection triggers instead of time-based
+
+# 4. SECURITY:
+#    - Face recognition should NOT be the only security measure
+#    - Use it as convenience, not primary authentication
+#    - Always have backup access methods
+
+# 5. PRIVACY:
+#    - Inform people they are being monitored
+#    - Face encodings cannot be reversed to images
+#    - All data stays local on your system
+
+# ==============================================================================
+# TROUBLESHOOTING
+# ==============================================================================
+
+# If services don't appear:
+# 1. Check logs: /config/home-assistant.log
+# 2. Verify folder structure: /config/custom_components/local_face_secure/
+# 3. Restart Home Assistant twice
+
+# If face recognition fails:
+# 1. Check camera image quality
+# 2. Ensure good lighting
+# 3. Test with camera.front_door in Developer Tools
+# 4. Check logs for specific errors
+
+# If installation hangs:
+# - face_recognition takes time to install (5-10 minutes)
+# - Check system resources (needs ~1GB RAM for compilation)
+# - Monitor logs during installation
+
+# ==============================================================================

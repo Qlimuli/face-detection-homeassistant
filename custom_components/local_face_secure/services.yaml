@@ -1,38 +1,30 @@
-# Service definitions for Local Face Secure
-# These are used by Home Assistant to generate the UI for services
-
 teach_face:
   name: Teach Face
-  description: >-
-    Capture a snapshot from a camera and learn a face. 
-    The image must contain exactly one face.
+  description: Capture a face from camera and add it to the known faces database.
   fields:
     entity_id:
-      name: Camera
-      description: The camera entity to capture the snapshot from.
+      name: Camera Entity
+      description: The camera entity to capture the face from.
       required: true
       example: "camera.front_door"
       selector:
         entity:
           domain: camera
     name:
-      name: Name
-      description: The name to associate with this face (e.g., person's name).
+      name: Person Name
+      description: The name to associate with this face.
       required: true
       example: "Stefan"
       selector:
         text:
 
 scan_match:
-  name: Scan & Match
-  description: >-
-    Capture a snapshot from a camera and compare detected faces against 
-    all stored face encodings. Fires a local_face_secure.recognized event 
-    for each matched face.
+  name: Scan and Match
+  description: Capture a face from camera and attempt to match it against known faces.
   fields:
     entity_id:
-      name: Camera
-      description: The camera entity to capture the snapshot from.
+      name: Camera Entity
+      description: The camera entity to capture the face from.
       required: true
       example: "camera.front_door"
       selector:
@@ -41,10 +33,10 @@ scan_match:
 
 delete_face:
   name: Delete Face
-  description: Remove a stored face encoding by name.
+  description: Remove a face from the known faces database.
   fields:
     name:
-      name: Name
+      name: Person Name
       description: The name of the face to delete.
       required: true
       example: "Stefan"
@@ -53,4 +45,4 @@ delete_face:
 
 list_faces:
   name: List Faces
-  description: Get a list of all stored face names.
+  description: Get a list of all known face names in the database.

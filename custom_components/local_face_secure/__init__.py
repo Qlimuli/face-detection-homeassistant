@@ -1,320 +1,233 @@
-"""Local Face Secure - Home Assistant Custom Component for local face recognition.
-
-This integration provides face recognition services using the face_recognition
-(dlib) library. All processing runs locally within Home Assistant - no external
-services or Docker containers required.
-
-Features:
-- Teach faces from camera snapshots
-- Match faces against stored encodings
-- Persistent storage of face encodings
-- Event firing on face recognition
-
-All CPU-bound operations run in the executor to avoid blocking the event loop.
-"""
-
-from __future__ import annotations
-
+"""The Local Face Secure integration."""
 import logging
-from typing import Any
-
 import voluptuous as vol
 
-from homeassistant.components.camera import async_get_image
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
-    DOMAIN,
-    SERVICE_TEACH_FACE,
-    SERVICE_SCAN_MATCH,
-    SERVICE_DELETE_FACE,
-    SERVICE_LIST_FACES,
+    ATTR_CONFIDENCE,
     ATTR_ENTITY_ID,
     ATTR_NAME,
+    DOMAIN,
+    ERROR_CAMERA_UNAVAILABLE,
+    ERROR_FACE_EXISTS,
+    ERROR_FACE_NOT_FOUND,
+    ERROR_INVALID_CAMERA,
+    ERROR_MULTIPLE_FACES,
+    ERROR_NO_FACE_DETECTED,
+    ERROR_SNAPSHOT_FAILED,
+    EVENT_FACE_DELETED,
     EVENT_FACE_RECOGNIZED,
-    EVENT_DATA_NAME,
-    EVENT_DATA_CONFIDENCE,
-    DEFAULT_TOLERANCE,
-    LOG_PREFIX,
+    EVENT_FACE_TAUGHT,
+    SERVICE_DELETE_FACE,
+    SERVICE_LIST_FACES,
+    SERVICE_SCAN_MATCH,
+    SERVICE_TEACH_FACE,
 )
-from .storage import FaceEncodingStore
-from .face_recognition_service import FaceRecognitionProcessor
+from .face_service import FaceRecognitionService
+from .storage import FaceStorage
 
 _LOGGER = logging.getLogger(__name__)
 
-# Service schemas with validation
-SERVICE_TEACH_FACE_SCHEMA = vol.Schema({
-    vol.Required(ATTR_ENTITY_ID): cv.entity_id,
-    vol.Required(ATTR_NAME): cv.string,
-})
+# Service schemas
+SERVICE_TEACH_FACE_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_ENTITY_ID): cv.entity_id,
+        vol.Required(ATTR_NAME): cv.string,
+    }
+)
 
-SERVICE_SCAN_MATCH_SCHEMA = vol.Schema({
-    vol.Required(ATTR_ENTITY_ID): cv.entity_id,
-})
+SERVICE_SCAN_MATCH_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_ENTITY_ID): cv.entity_id,
+    }
+)
 
-SERVICE_DELETE_FACE_SCHEMA = vol.Schema({
-    vol.Required(ATTR_NAME): cv.string,
-})
+SERVICE_DELETE_FACE_SCHEMA = vol.Schema(
+    {
+        vol.Required(ATTR_NAME): cv.string,
+    }
+)
 
-# Configuration schema (minimal - component uses config entries or defaults)
-CONFIG_SCHEMA = vol.Schema({
-    DOMAIN: vol.Schema({
-        vol.Optional("tolerance", default=DEFAULT_TOLERANCE): vol.All(
-            vol.Coerce(float),
-            vol.Range(min=0.0, max=1.0)
-        ),
-    })
-}, extra=vol.ALLOW_EXTRA)
+SERVICE_LIST_FACES_SCHEMA = vol.Schema({})
+
+# Configuration schema
+CONFIG_SCHEMA = vol.Schema(
+    {
+        DOMAIN: vol.Schema({}),
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the Local Face Secure component.
-    
-    This is called by Home Assistant when the component is loaded.
-    We initialize storage, load persisted data, and register services.
-    
-    Args:
-        hass: Home Assistant instance.
-        config: Configuration from configuration.yaml.
-        
-    Returns:
-        True if setup was successful.
-    """
-    _LOGGER.info("%s Setting up Local Face Secure integration", LOG_PREFIX)
+    """Set up the Local Face Secure component."""
+    _LOGGER.info("Setting up Local Face Secure integration")
 
-    # Get configuration options
-    conf = config.get(DOMAIN, {})
-    tolerance = conf.get("tolerance", DEFAULT_TOLERANCE)
+    # Initialize storage
+    storage = FaceStorage(hass)
+    await storage.async_load()
 
-    # Initialize the face encoding store and load persisted data
-    store = FaceEncodingStore(hass)
-    await store.async_load()
+    # Initialize face recognition service
+    face_service = FaceRecognitionService(hass, storage)
 
-    # Initialize the face recognition processor
-    processor = FaceRecognitionProcessor(hass, tolerance=tolerance)
-
-    # Store references in hass.data for access by services
+    # Store instances in hass.data
     hass.data[DOMAIN] = {
-        "store": store,
-        "processor": processor,
-        "tolerance": tolerance,
+        "storage": storage,
+        "service": face_service,
     }
 
     # Register services
-    await _async_register_services(hass)
-
-    _LOGGER.info(
-        "%s Setup complete. %d face(s) loaded from storage",
-        LOG_PREFIX, store.count
-    )
-    return True
-
-
-async def _async_register_services(hass: HomeAssistant) -> None:
-    """Register all component services.
-    
-    Services are the primary way users interact with this component.
-    Each service is wrapped with error handling to prevent crashes.
-    """
-
-    async def handle_teach_face(call: ServiceCall) -> dict[str, Any]:
-        """Handle the teach_face service call.
-        
-        Captures a snapshot from the specified camera, detects exactly one face,
-        computes its encoding, and stores it with the given name.
-        
-        Service data:
-            entity_id: Camera entity to capture from
-            name: Name to associate with the face
-            
-        Returns:
-            Service response with success status and message.
-        """
+    async def handle_teach_face(call: ServiceCall) -> None:
+        """Handle teach_face service call."""
         entity_id = call.data[ATTR_ENTITY_ID]
-        name = call.data[ATTR_NAME].strip()
+        name = call.data[ATTR_NAME]
 
-        if not name:
-            raise HomeAssistantError("Name cannot be empty")
+        _LOGGER.info("Service call: teach_face for %s from %s", name, entity_id)
 
-        _LOGGER.info(
-            "%s Teaching face '%s' from camera %s",
-            LOG_PREFIX, name, entity_id
-        )
+        # Validate camera entity
+        if not _is_valid_camera_entity(hass, entity_id):
+            _LOGGER.error("Invalid camera entity: %s", entity_id)
+            raise ValueError(ERROR_INVALID_CAMERA)
 
-        store: FaceEncodingStore = hass.data[DOMAIN]["store"]
-        processor: FaceRecognitionProcessor = hass.data[DOMAIN]["processor"]
-
-        # Capture snapshot from camera
         try:
-            # async_get_image is the standard way to get camera snapshots
-            # It handles various camera integrations transparently
-            image = await async_get_image(hass, entity_id)
-        except HomeAssistantError as err:
-            _LOGGER.error(
-                "%s Failed to capture image from %s: %s",
-                LOG_PREFIX, entity_id, err
+            await face_service.async_teach_face(entity_id, name, overwrite=False)
+
+            # Fire event
+            hass.bus.async_fire(
+                EVENT_FACE_TAUGHT,
+                {
+                    ATTR_NAME: name,
+                    ATTR_ENTITY_ID: entity_id,
+                },
             )
-            raise HomeAssistantError(
+
+            _LOGGER.info("Successfully taught face: %s", name)
+
+        except ValueError as err:
+            error_msg = str(err)
+            _LOGGER.error("Failed to teach face %s: %s", name, error_msg)
+            
+            # Provide user-friendly error messages
+            if ERROR_FACE_EXISTS in error_msg or "already exists" in error_msg:
+                raise ValueError(
+                    f"Face '{name}' already exists. Delete it first or use a different name."
+                ) from err
+            elif ERROR_NO_FACE_DETECTED in error_msg:
+                raise ValueError(
+                    "No face detected in camera image. Please ensure a face is clearly visible."
+                ) from err
+            elif ERROR_MULTIPLE_FACES in error_msg:
+                raise ValueError(
+                    "Multiple faces detected. Please ensure only one person is in frame."
+                ) from err
+            else:
+                raise
+
+        except RuntimeError as err:
+            _LOGGER.error("Runtime error teaching face %s: %s", name, err)
+            raise ValueError(
                 f"Failed to capture image from camera: {err}"
             ) from err
 
-        # Detect and encode the face
-        result = await processor.async_detect_and_encode(image.content)
-
-        if not result.success:
-            _LOGGER.warning(
-                "%s Face teaching failed for '%s': %s",
-                LOG_PREFIX, name, result.error_message
-            )
-            raise HomeAssistantError(result.error_message)
-
-        # Store the encoding
-        store.add_encoding(name, result.encoding)
-        
-        # Persist to storage
-        await store.async_save()
-
-        _LOGGER.info(
-            "%s Successfully learned face for '%s'",
-            LOG_PREFIX, name
-        )
-
-        return {
-            "success": True,
-            "message": f"Successfully learned face for '{name}'",
-            "name": name,
-        }
-
-    async def handle_scan_match(call: ServiceCall) -> dict[str, Any]:
-        """Handle the scan_match service call.
-        
-        Captures a snapshot from the specified camera and compares all
-        detected faces against stored encodings. Fires an event for
-        each recognized face.
-        
-        Service data:
-            entity_id: Camera entity to capture from
-            
-        Returns:
-            Service response with list of matched faces.
-        """
+    async def handle_scan_match(call: ServiceCall) -> None:
+        """Handle scan_match service call."""
         entity_id = call.data[ATTR_ENTITY_ID]
 
-        _LOGGER.debug("%s Scanning for faces from %s", LOG_PREFIX, entity_id)
+        _LOGGER.info("Service call: scan_match from %s", entity_id)
 
-        store: FaceEncodingStore = hass.data[DOMAIN]["store"]
-        processor: FaceRecognitionProcessor = hass.data[DOMAIN]["processor"]
+        # Validate camera entity
+        if not _is_valid_camera_entity(hass, entity_id):
+            _LOGGER.error("Invalid camera entity: %s", entity_id)
+            raise ValueError(ERROR_INVALID_CAMERA)
 
-        # Check if we have any faces to match against
-        known_encodings = store.get_all_encodings()
-        if not known_encodings:
-            _LOGGER.warning("%s No faces stored, cannot perform matching", LOG_PREFIX)
-            return {
-                "success": False,
-                "message": "No faces stored. Use teach_face first.",
-                "matches": [],
-            }
-
-        # Capture snapshot from camera
         try:
-            image = await async_get_image(hass, entity_id)
-        except HomeAssistantError as err:
-            _LOGGER.error(
-                "%s Failed to capture image from %s: %s",
-                LOG_PREFIX, entity_id, err
-            )
-            raise HomeAssistantError(
+            result = await face_service.async_recognize_face(entity_id)
+
+            if result:
+                # Fire recognition event
+                hass.bus.async_fire(
+                    EVENT_FACE_RECOGNIZED,
+                    {
+                        ATTR_NAME: result["name"],
+                        ATTR_CONFIDENCE: result["confidence"],
+                        ATTR_ENTITY_ID: entity_id,
+                    },
+                )
+
+                _LOGGER.info(
+                    "Face recognized: %s (%.1f%% confidence)",
+                    result["name"],
+                    result["confidence"],
+                )
+            else:
+                _LOGGER.info("No matching face found")
+
+        except ValueError as err:
+            error_msg = str(err)
+            _LOGGER.error("Failed to scan face: %s", error_msg)
+
+            # Provide user-friendly error messages
+            if ERROR_NO_FACE_DETECTED in error_msg:
+                raise ValueError(
+                    "No face detected in camera image. Please ensure a face is clearly visible."
+                ) from err
+            elif ERROR_MULTIPLE_FACES in error_msg:
+                raise ValueError(
+                    "Multiple faces detected. Please ensure only one person is in frame."
+                ) from err
+            else:
+                raise
+
+        except RuntimeError as err:
+            _LOGGER.error("Runtime error scanning face: %s", err)
+            raise ValueError(
                 f"Failed to capture image from camera: {err}"
             ) from err
 
-        # Find matches
-        matches = await processor.async_find_matches(
-            image.content,
-            known_encodings
-        )
+    async def handle_delete_face(call: ServiceCall) -> None:
+        """Handle delete_face service call."""
+        name = call.data[ATTR_NAME]
 
-        # Fire events for each match
-        for match in matches:
-            event_data = {
-                EVENT_DATA_NAME: match.name,
-                EVENT_DATA_CONFIDENCE: match.confidence,
-            }
-            hass.bus.async_fire(EVENT_FACE_RECOGNIZED, event_data)
-            _LOGGER.info(
-                "%s Recognized '%s' with %d%% confidence",
-                LOG_PREFIX, match.name, match.confidence
+        _LOGGER.info("Service call: delete_face for %s", name)
+
+        try:
+            await face_service.async_delete_face(name)
+
+            # Fire event
+            hass.bus.async_fire(
+                EVENT_FACE_DELETED,
+                {
+                    ATTR_NAME: name,
+                },
             )
 
-        return {
-            "success": True,
-            "matches": [
-                {"name": m.name, "confidence": m.confidence}
-                for m in matches
-            ],
-            "message": f"Found {len(matches)} match(es)",
-        }
+            _LOGGER.info("Successfully deleted face: %s", name)
 
-    async def handle_delete_face(call: ServiceCall) -> dict[str, Any]:
-        """Handle the delete_face service call.
-        
-        Removes a stored face encoding by name.
-        
-        Service data:
-            name: Name of the face to delete
-            
-        Returns:
-            Service response with success status.
-        """
-        name = call.data[ATTR_NAME].strip()
+        except KeyError as err:
+            _LOGGER.error("Face not found: %s", name)
+            raise ValueError(f"Face '{name}' not found in database") from err
 
-        _LOGGER.info("%s Deleting face '%s'", LOG_PREFIX, name)
+    async def handle_list_faces(call: ServiceCall) -> None:
+        """Handle list_faces service call."""
+        _LOGGER.info("Service call: list_faces")
 
-        store: FaceEncodingStore = hass.data[DOMAIN]["store"]
+        faces = face_service.list_faces()
+        _LOGGER.info("Known faces: %s", ", ".join(faces) if faces else "None")
 
-        if not store.remove_encoding(name):
-            raise HomeAssistantError(f"No face found with name '{name}'")
+        # Return as service response
+        return {"faces": faces}
 
-        # Persist the change
-        await store.async_save()
-
-        _LOGGER.info("%s Successfully deleted face '%s'", LOG_PREFIX, name)
-
-        return {
-            "success": True,
-            "message": f"Successfully deleted face '{name}'",
-            "name": name,
-        }
-
-    async def handle_list_faces(call: ServiceCall) -> dict[str, Any]:
-        """Handle the list_faces service call.
-        
-        Returns a list of all stored face names.
-        
-        Returns:
-            Service response with list of face names.
-        """
-        store: FaceEncodingStore = hass.data[DOMAIN]["store"]
-        names = store.get_names()
-
-        _LOGGER.debug("%s Listing %d stored face(s)", LOG_PREFIX, len(names))
-
-        return {
-            "success": True,
-            "faces": names,
-            "count": len(names),
-        }
-
-    # Register all services with their schemas
-    # SupportsResponse.OPTIONAL allows services to return data
+    # Register all services
     hass.services.async_register(
         DOMAIN,
         SERVICE_TEACH_FACE,
         handle_teach_face,
         schema=SERVICE_TEACH_FACE_SCHEMA,
-        supports_response=SupportsResponse.OPTIONAL,
     )
 
     hass.services.async_register(
@@ -322,7 +235,6 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         SERVICE_SCAN_MATCH,
         handle_scan_match,
         schema=SERVICE_SCAN_MATCH_SCHEMA,
-        supports_response=SupportsResponse.OPTIONAL,
     )
 
     hass.services.async_register(
@@ -330,15 +242,55 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         SERVICE_DELETE_FACE,
         handle_delete_face,
         schema=SERVICE_DELETE_FACE_SCHEMA,
-        supports_response=SupportsResponse.OPTIONAL,
     )
 
     hass.services.async_register(
         DOMAIN,
         SERVICE_LIST_FACES,
         handle_list_faces,
-        schema=None,  # No parameters needed
-        supports_response=SupportsResponse.OPTIONAL,
+        schema=SERVICE_LIST_FACES_SCHEMA,
+        supports_response=True,
     )
 
-    _LOGGER.debug("%s Registered %d services", LOG_PREFIX, 4)
+    _LOGGER.info("Local Face Secure integration setup complete")
+
+    return True
+
+
+def _is_valid_camera_entity(hass: HomeAssistant, entity_id: str) -> bool:
+    """
+    Validate that entity is a camera.
+    
+    Args:
+        hass: Home Assistant instance
+        entity_id: Entity ID to validate
+        
+    Returns:
+        True if entity is a valid camera
+    """
+    # Check if entity exists
+    state = hass.states.get(entity_id)
+    if state is None:
+        return False
+
+    # Check if it's a camera entity
+    if not entity_id.startswith("camera."):
+        return False
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    _LOGGER.info("Unloading Local Face Secure integration")
+
+    # Remove services
+    hass.services.async_remove(DOMAIN, SERVICE_TEACH_FACE)
+    hass.services.async_remove(DOMAIN, SERVICE_SCAN_MATCH)
+    hass.services.async_remove(DOMAIN, SERVICE_DELETE_FACE)
+    hass.services.async_remove(DOMAIN, SERVICE_LIST_FACES)
+
+    # Clean up data
+    hass.data.pop(DOMAIN, None)
+
+    return True
