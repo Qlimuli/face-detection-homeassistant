@@ -1,10 +1,11 @@
 {
   "domain": "local_face_secure",
   "name": "Local Face Secure",
-  "codeowners": ["@homeassistant"],
+  "codeowners": ["@Qlimuli"],
   "config_flow": false,
-  "documentation": "https://github.com/yourusername/local_face_secure",
+  "documentation": "https://github.com/Qlimuli/face-detection-homeassistant",
+  "issue_tracker": "https://github.com/Qlimuli/face-detection-homeassistant/issues",
   "requirements": ["face_recognition==1.3.0"],
   "version": "1.0.0",
-  "iot_class": "local_polling"
+  "iot_class": "local_push"
 }
